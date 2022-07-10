@@ -3,10 +3,20 @@ import io.ktor.network.sockets.*
 import io.ktor.utils.io.*
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
+import org.apache.kafka.common.message.*
+import org.apache.kafka.common.protocol.*
+import org.apache.kafka.common.requests.ApiVersionsRequest
+import org.apache.kafka.common.requests.RequestHeader
 import org.slf4j.LoggerFactory
+import java.io.Closeable
 import java.io.IOException
-import java.util.*
+import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.CoroutineContext
+
+private val log = LoggerFactory.getLogger({}::class.java)
+
+private const val version = (3).toShort()
 
 class KafkaClient(
     private val host: String,
@@ -15,10 +25,15 @@ class KafkaClient(
     private val replyTimeoutMillis: Long = 15000L,
 ) : CoroutineScope {
 
+
     override val coroutineContext: CoroutineContext
         get() = Dispatchers.IO + Job()
 
-    private val log = LoggerFactory.getLogger(this::class.java)
+    private val serializationCache = ObjectSerializationCache()
+
+    private val correlationId = AtomicInteger()
+
+    private val requestTypes = LRUCache<Int, Int>(100)
 
     fun sendApiRequest() {
         startKafkaConnection()
@@ -30,12 +45,48 @@ class KafkaClient(
 
         val writeChannel = socket.openWriteChannel(autoFlush = true)
         val readChannel = socket.openReadChannel()
-        sendKafkaRequest(writeChannel, ApiVersionRequest("consumer-test_consumer_group_1655575623452-1", "apache-kafka-java", "2.8.0"), 10000)
-        val firstReplyByte = readChannel.readInt(ByteOrder.BIG_ENDIAN)
-        log.info("firstReplyByte: $firstReplyByte")
-        val remaining = readChannel.readRemaining(firstReplyByte.toLong())
-        log.info("resp: "+HexFormat.of().formatHex(remaining.readBytes()))
+        val apiVersionsRequestData = ApiVersionsRequestData()
+        apiVersionsRequestData.setClientSoftwareName("test")
+        apiVersionsRequestData.setClientSoftwareVersion("1.0.0")
+        val apiMessage = ApiVersionsRequest(apiVersionsRequestData, version).data()
+        sendApiMessage(writeChannel, apiMessage)
+        val resp = readChannel.readKafkaResponse(ApiKeys.forId(apiMessage.apiKey().toInt()))
+        log.info("resp: "+ resp.highestSupportedVersion())
         socket.close()
+    }
+
+    private suspend fun sendApiMessage(writeChannel: ByteWriteChannel, apiMessage: ApiMessage) {
+        val header =
+            RequestHeader(ApiKeys.forId(apiMessage.apiKey().toInt()), version, "test", correlationId.incrementAndGet()).data()
+        val messageSize = MessageSizeAccumulator()
+        header.addSize(messageSize, serializationCache, version)
+        apiMessage.addSize(messageSize, serializationCache, version)
+        val bytePacketBuilder = BytePacketBuilder()
+        bytePacketBuilder.writeInt(messageSize.totalSize())
+        header.write(bytePacketBuilder, serializationCache, version)
+        apiMessage.write(bytePacketBuilder, serializationCache, version)
+        sendKafkaPacket(writeChannel, bytePacketBuilder, 10000)
+    }
+
+    private suspend fun sendKafkaPacket(
+        writeChannel: ByteWriteChannel,
+        bytePacketBuilder: BytePacketBuilder,
+        timeoutMillis: Long
+    ): Boolean {
+        try {
+            withTimeout(timeoutMillis) {
+                writeChannel.writePacket(bytePacketBuilder.build())
+                log.debug("Sent command")
+            }
+        } catch (te: TimeoutCancellationException) {
+            log.error("Failed to send kafka command, got timeout")
+            return false
+        } catch (ioe: IOException) {
+            log.error("Failed to send kafka command, I/O error: ${ioe.message}")
+            return false
+        }
+
+        return true
     }
 
     private suspend fun sendKafkaRequest(
@@ -60,6 +111,212 @@ class KafkaClient(
     }
 }
 
+class BytePacketBuilderWritable(private val bytePacketBuilder: BytePacketBuilder) : Writable,
+    Closeable {
+    override fun writeByte(value: Byte) {
+        bytePacketBuilder.writeByte(value)
+    }
+
+    override fun writeShort(value: Short) {
+        bytePacketBuilder.writeShort(value)
+    }
+
+    override fun writeInt(value: Int) {
+        bytePacketBuilder.writeInt(value)
+    }
+
+    override fun writeLong(value: Long) {
+        bytePacketBuilder.writeLong(value)
+    }
+
+    override fun writeDouble(value: Double) {
+        bytePacketBuilder.writeDouble(value)
+    }
+
+    override fun writeByteArray(arr: ByteArray) {
+        bytePacketBuilder.writeFully(arr, 0, arr.size)
+    }
+
+    override fun writeUnsignedVarint(i: Int) {
+        var value = i
+        while ((value and -0x80) != 0) {
+            val b = (value and 0b1111111 or 0b10000000).toByte()
+            bytePacketBuilder.writeByte(b)
+            value = value ushr 7
+        }
+        bytePacketBuilder.writeByte(value.toByte())
+    }
+
+    override fun writeByteBuffer(buf: ByteBuffer) {
+        bytePacketBuilder.writeFully(buf)
+    }
+
+    override fun writeVarint(value: Int) {
+        writeUnsignedVarint(value shl 1 xor (value shr 31))
+    }
+
+    override fun writeVarlong(value: Long) {
+        var v: Long = value shl 1 xor (value shr 63)
+        while (v and -0x80L != 0L) {
+            bytePacketBuilder.writeByte((v.toInt() and 0b1111111 or 0b10000000).toByte())
+            v = v ushr 7
+        }
+        bytePacketBuilder.writeByte(v.toByte())
+
+    }
+
+    override fun close() {
+        bytePacketBuilder.close()
+    }
+
+}
+
+class ByteReadPacketReadable(private val byteReadPacket: ByteReadPacket) : Readable {
+    override fun readByte(): Byte {
+        return byteReadPacket.readByte()
+    }
+
+    override fun readShort(): Short {
+        return byteReadPacket.readShort()
+    }
+
+    override fun readInt(): Int {
+        return byteReadPacket.readInt()
+    }
+
+    override fun readLong(): Long {
+        return byteReadPacket.readLong()
+    }
+
+    override fun readDouble(): Double {
+        return byteReadPacket.readDouble()
+    }
+
+    override fun readArray(arr: ByteArray) {
+        byteReadPacket.readAvailable(arr)
+    }
+
+    override fun readUnsignedVarint(): Int {
+        var value = 0
+        var i = 0
+        var b: Int
+        while (byteReadPacket.readByte().also { b = it.toInt() }.toInt() and 0x80 != 0) {
+            value = value or (b and 0x7f shl i)
+            i += 7
+            if (i > 28) throw IllegalArgumentException("Illegal varint: $value")
+        }
+        value = value or (b shl i)
+        return value
+    }
+
+    override fun readByteBuffer(length: Int): ByteBuffer {
+        return byteReadPacket.readByteBuffer(length)
+    }
+
+    override fun readVarint(): Int {
+        val value = readUnsignedVarint()
+        return value ushr 1 xor -(value and 1)
+    }
+
+    override fun readVarlong(): Long {
+        var value = 0L
+        var i = 0
+        var b: Long
+        while (readByte().also { b = it.toLong() }.toLong() and 0x80L != 0L) {
+            value = value or (b and 0x7fL shl i)
+            i += 7
+            if (i > 63) throw IllegalArgumentException("Illegal varlong: $value")
+        }
+        value = value or (b shl i)
+        return value ushr 1 xor -(value and 1L)
+
+    }
+
+    fun peek(): ByteArray {
+        return byteReadPacket.copy().readBytes()
+    }
+
+}
+
+private fun Message.write(builder: BytePacketBuilder, cache: ObjectSerializationCache, version: Short) {
+    write(BytePacketBuilderWritable(builder), cache, version)
+}
+
+private suspend fun ByteReadChannel.readKafkaResponse(apiKey: ApiKeys): ApiMessage {
+    val messageSize = readInt(ByteOrder.BIG_ENDIAN)
+    val packet = readPacket(messageSize)
+    val packetReadable = ByteReadPacketReadable(packet)
+    val responseHeader = ResponseHeaderData(packetReadable, apiKey.responseHeaderVersion(version))
+    return when (apiKey) {
+        ApiKeys.PRODUCE -> ProduceResponseData(packetReadable, version)
+        ApiKeys.FETCH -> FetchRequestData(packetReadable, version)
+        ApiKeys.LIST_OFFSETS -> ListOffsetsResponseData(packetReadable, version)
+        ApiKeys.METADATA -> MetadataResponseData(packetReadable, version)
+        ApiKeys.LEADER_AND_ISR -> LeaderAndIsrResponseData(packetReadable, version)
+        ApiKeys.STOP_REPLICA -> StopReplicaResponseData(packetReadable, version)
+        ApiKeys.UPDATE_METADATA -> UpdateFeaturesResponseData(packetReadable, version)
+        ApiKeys.CONTROLLED_SHUTDOWN -> ControlledShutdownResponseData(packetReadable, version)
+        ApiKeys.OFFSET_COMMIT -> OffsetCommitResponseData(packetReadable, version)
+        ApiKeys.OFFSET_FETCH -> OffsetFetchResponseData(packetReadable, version)
+        ApiKeys.FIND_COORDINATOR -> FindCoordinatorResponseData(packetReadable, version)
+        ApiKeys.JOIN_GROUP -> JoinGroupResponseData(packetReadable, version)
+        ApiKeys.HEARTBEAT -> HeartbeatResponseData(packetReadable, version)
+        ApiKeys.LEAVE_GROUP -> LeaveGroupResponseData(packetReadable, version)
+        ApiKeys.SYNC_GROUP -> SyncGroupResponseData(packetReadable, version)
+        ApiKeys.DESCRIBE_GROUPS -> DescribeGroupsResponseData(packetReadable, version)
+        ApiKeys.LIST_GROUPS -> ListGroupsResponseData(packetReadable, version)
+        ApiKeys.SASL_HANDSHAKE -> SaslHandshakeResponseData(packetReadable, version)
+        ApiKeys.API_VERSIONS -> ApiVersionsResponseData(packetReadable, version)
+        ApiKeys.CREATE_TOPICS -> CreateTopicsResponseData(packetReadable, version)
+        ApiKeys.DELETE_TOPICS -> DeleteTopicsResponseData(packetReadable, version)
+        ApiKeys.DELETE_RECORDS -> DeleteRecordsResponseData(packetReadable, version)
+        ApiKeys.INIT_PRODUCER_ID -> InitProducerIdResponseData(packetReadable, version)
+        ApiKeys.OFFSET_FOR_LEADER_EPOCH -> OffsetForLeaderEpochResponseData(packetReadable, version)
+        ApiKeys.ADD_PARTITIONS_TO_TXN -> AddPartitionsToTxnResponseData(packetReadable, version)
+        ApiKeys.ADD_OFFSETS_TO_TXN -> AddOffsetsToTxnResponseData(packetReadable, version)
+        ApiKeys.END_TXN -> EndTxnResponseData(packetReadable, version)
+        ApiKeys.WRITE_TXN_MARKERS -> WriteTxnMarkersResponseData(packetReadable, version)
+        ApiKeys.TXN_OFFSET_COMMIT -> TxnOffsetCommitResponseData(packetReadable, version)
+        ApiKeys.DESCRIBE_ACLS -> DescribeAclsResponseData(packetReadable, version)
+        ApiKeys.CREATE_ACLS -> CreateAclsResponseData(packetReadable, version)
+        ApiKeys.DELETE_ACLS -> DeleteAclsResponseData(packetReadable, version)
+        ApiKeys.DESCRIBE_CONFIGS -> DescribeConfigsResponseData(packetReadable, version)
+        ApiKeys.ALTER_CONFIGS -> AlterConfigsResponseData(packetReadable, version)
+        ApiKeys.ALTER_REPLICA_LOG_DIRS -> AlterReplicaLogDirsResponseData(packetReadable, version)
+        ApiKeys.DESCRIBE_LOG_DIRS -> DescribeLogDirsResponseData(packetReadable, version)
+        ApiKeys.SASL_AUTHENTICATE -> SaslAuthenticateResponseData(packetReadable, version)
+        ApiKeys.CREATE_PARTITIONS -> CreatePartitionsResponseData(packetReadable, version)
+        ApiKeys.CREATE_DELEGATION_TOKEN -> CreateDelegationTokenResponseData(packetReadable, version)
+        ApiKeys.RENEW_DELEGATION_TOKEN -> RenewDelegationTokenResponseData(packetReadable, version)
+        ApiKeys.EXPIRE_DELEGATION_TOKEN -> ExpireDelegationTokenResponseData(packetReadable, version)
+        ApiKeys.DESCRIBE_DELEGATION_TOKEN -> DescribeDelegationTokenResponseData(packetReadable, version)
+        ApiKeys.DELETE_GROUPS -> DeleteGroupsResponseData(packetReadable, version)
+        ApiKeys.ELECT_LEADERS -> ElectLeadersResponseData(packetReadable, version)
+        ApiKeys.INCREMENTAL_ALTER_CONFIGS -> IncrementalAlterConfigsResponseData(packetReadable, version)
+        ApiKeys.ALTER_PARTITION_REASSIGNMENTS -> AlterPartitionReassignmentsResponseData(packetReadable, version)
+        ApiKeys.LIST_PARTITION_REASSIGNMENTS -> ListPartitionReassignmentsResponseData(packetReadable, version)
+        ApiKeys.OFFSET_DELETE -> OffsetDeleteResponseData(packetReadable, version)
+        ApiKeys.DESCRIBE_CLIENT_QUOTAS -> DescribeClientQuotasResponseData(packetReadable, version)
+        ApiKeys.ALTER_CLIENT_QUOTAS -> AlterClientQuotasResponseData(packetReadable, version)
+        ApiKeys.DESCRIBE_USER_SCRAM_CREDENTIALS -> DescribeUserScramCredentialsResponseData(packetReadable, version)
+        ApiKeys.ALTER_USER_SCRAM_CREDENTIALS -> AlterUserScramCredentialsResponseData(packetReadable, version)
+        ApiKeys.VOTE -> VoteResponseData(packetReadable, version)
+        ApiKeys.BEGIN_QUORUM_EPOCH -> BeginQuorumEpochResponseData(packetReadable, version)
+        ApiKeys.END_QUORUM_EPOCH -> EndQuorumEpochResponseData(packetReadable, version)
+        ApiKeys.DESCRIBE_QUORUM -> DescribeQuorumResponseData(packetReadable, version)
+        ApiKeys.ALTER_ISR -> AlterIsrResponseData(packetReadable, version)
+        ApiKeys.UPDATE_FEATURES -> UpdateMetadataResponseData(packetReadable, version)
+        ApiKeys.ENVELOPE -> EnvelopeResponseData(packetReadable, version)
+        ApiKeys.FETCH_SNAPSHOT -> FetchSnapshotResponseData(packetReadable, version)
+        ApiKeys.DESCRIBE_CLUSTER -> DescribeClusterResponseData(packetReadable, version)
+        ApiKeys.DESCRIBE_PRODUCERS -> DescribeProducersResponseData(packetReadable, version)
+        ApiKeys.BROKER_REGISTRATION -> BrokerRegistrationResponseData(packetReadable, version)
+        ApiKeys.BROKER_HEARTBEAT -> BrokerHeartbeatResponseData(packetReadable, version)
+        ApiKeys.UNREGISTER_BROKER -> UnregisterBrokerResponseData(packetReadable, version)
+    }
+
+}
+
 fun BytePacketBuilder.writeKafkaHeader(header: KafkaHeader) {
     writeInt(header.messageLength)
     writeShort(header.apiKey)
@@ -67,25 +324,30 @@ fun BytePacketBuilder.writeKafkaHeader(header: KafkaHeader) {
     writeInt(header.correlationId)
 }
 
-data class KafkaHeader(val messageLength: Int, val apiKey: Short, val apiVersion: Short, val correlationId: Int) 
+data class KafkaHeader(val messageLength: Int, val apiKey: Short, val apiVersion: Short, val correlationId: Int)
 sealed class KafkaMessage() {
-   abstract fun toPacket(): ByteReadPacket
+    abstract fun toPacket(): ByteReadPacket
 }
-class ApiVersionRequest(private val clientId: String, private val clientSoftwareName: String, private val clientSoftwareVersion: String): KafkaMessage() {
+
+class ApiVersionRequest(
+    private val clientId: String,
+    private val clientSoftwareName: String,
+    private val clientSoftwareVersion: String
+) : KafkaMessage() {
     private fun writePacket(builder: BytePacketBuilder) {
         builder.writeNullableString(clientId)
         builder.writeCompactString(clientSoftwareName)
         builder.writeCompactString(clientSoftwareVersion)
         builder.writeByte(0)
     }
-    
+
     override fun toPacket(): ByteReadPacket {
         val builder = BytePacketBuilder()
         writePacket(builder)
-        val headerSize = 2+2+4
+        val headerSize = 2 + 2 + 4
         val messageSize = builder.size + headerSize
         builder.reset()
-        val header = KafkaHeader(messageSize, 18, 3, 1)
+        val header = KafkaHeader(messageSize, 18, version, 1)
         builder.writeKafkaHeader(header)
         writePacket(builder)
         return builder.build()
@@ -97,7 +359,6 @@ private fun BytePacketBuilder.writeNullableString(text: String) {
     writeText(text)
     writeByte(0)
 }
-
 
 private fun BytePacketBuilder.writeCompactString(text: String) {
     writeByte((text.length + 1).toByte())
