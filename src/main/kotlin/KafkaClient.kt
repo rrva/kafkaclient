@@ -149,27 +149,6 @@ class KafkaClient(
 
         return true
     }
-
-    private suspend fun sendKafkaRequest(
-        writeChannel: ByteWriteChannel,
-        msg: KafkaMessage,
-        timeoutMillis: Long
-    ): Boolean {
-        try {
-            withTimeout(timeoutMillis) {
-                writeChannel.writePacket(msg.toPacket())
-                log.debug("Sent command")
-            }
-        } catch (te: TimeoutCancellationException) {
-            log.error("Failed to send kafka command ${msg}, got timeout")
-            return false
-        } catch (ioe: IOException) {
-            log.error("Failed to send kafka command ${msg}, I/O error: ${ioe.message}")
-            return false
-        }
-
-        return true
-    }
 }
 
 class BytePacketBuilderWritable(private val bytePacketBuilder: BytePacketBuilder) : Writable,
@@ -522,55 +501,6 @@ private suspend inline fun <reified T : AbstractResponse> ByteReadChannel.readKa
     }
     return resp as T
 }
-
-fun BytePacketBuilder.writeKafkaHeader(header: KafkaHeader) {
-    writeInt(header.messageLength)
-    writeShort(header.apiKey)
-    writeShort(header.apiVersion)
-    writeInt(header.correlationId)
-}
-
-data class KafkaHeader(val messageLength: Int, val apiKey: Short, val apiVersion: Short, val correlationId: Int)
-sealed class KafkaMessage() {
-    abstract fun toPacket(): ByteReadPacket
-}
-
-class ApiVersionRequest(
-    private val clientId: String,
-    private val clientSoftwareName: String,
-    private val clientSoftwareVersion: String
-) : KafkaMessage() {
-    private fun writePacket(builder: BytePacketBuilder) {
-        builder.writeNullableString(clientId)
-        builder.writeCompactString(clientSoftwareName)
-        builder.writeCompactString(clientSoftwareVersion)
-        builder.writeByte(0)
-    }
-
-    override fun toPacket(): ByteReadPacket {
-        val builder = BytePacketBuilder()
-        writePacket(builder)
-        val headerSize = 2 + 2 + 4
-        val messageSize = builder.size + headerSize
-        builder.reset()
-        val header = KafkaHeader(messageSize, 18, version, 1)
-        builder.writeKafkaHeader(header)
-        writePacket(builder)
-        return builder.build()
-    }
-}
-
-private fun BytePacketBuilder.writeNullableString(text: String) {
-    writeShort(text.length.toShort())
-    writeText(text)
-    writeByte(0)
-}
-
-private fun BytePacketBuilder.writeCompactString(text: String) {
-    writeByte((text.length + 1).toByte())
-    writeText(text)
-}
-
 fun main() {
     val kafkaClient = KafkaClient("localhost", 443)
     runBlocking {
