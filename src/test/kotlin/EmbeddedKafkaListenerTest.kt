@@ -3,7 +3,6 @@ import io.kotest.core.spec.style.FunSpec
 import io.kotest.extensions.embedded.kafka.embeddedKafkaListener
 import kotlinx.coroutines.delay
 import org.slf4j.LoggerFactory
-import java.time.Duration
 import kotlin.time.ExperimentalTime
 
 @OptIn(ExperimentalTime::class)
@@ -23,7 +22,7 @@ class EmbeddedKafkaListenerTest : FunSpec({
         val kafkaClient = KafkaClient(embeddedKafkaListener.host, embeddedKafkaListener.port)
         runBlocking {
             delay(1000)
-            kafkaClient.sendApiRequest()
+            kafkaClient.start()
             delay(1000)
         }
 

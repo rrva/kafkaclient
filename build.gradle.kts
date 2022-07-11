@@ -25,8 +25,10 @@ dependencies {
     implementation("ch.qos.logback:logback-classic:1.2.11")
     implementation("ch.qos.logback:logback-core:1.2.11")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.2")
-    implementation("io.ktor:ktor-network:2.0.2")
-
+    implementation("io.ktor:ktor-network:2.0.3")
+    implementation("io.ktor:ktor-network-tls:2.0.3")
+    implementation("io.ktor:ktor-network-tls:2.0.3:sources")
+    implementation("io.ktor:ktor-network-tls-jvm:2.0.3:sources")
 }
 
 tasks.test {

@@ -1,5 +1,6 @@
 import io.ktor.network.selector.*
 import io.ktor.network.sockets.*
+import io.ktor.network.tls.*
 import io.ktor.utils.io.*
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
@@ -11,9 +12,10 @@ import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.IOException
 import java.nio.ByteBuffer
+import java.security.cert.X509Certificate
 import java.util.concurrent.atomic.AtomicInteger
+import javax.net.ssl.X509TrustManager
 import kotlin.coroutines.CoroutineContext
-import kotlin.reflect.KClass
 
 private val log = LoggerFactory.getLogger({}::class.java)
 
@@ -26,6 +28,7 @@ class KafkaClient(
     private val replyTimeoutMillis: Long = 15000L,
 ) : CoroutineScope {
 
+    private lateinit var apiVersions: ApiVersionsResponse
 
     override val coroutineContext: CoroutineContext
         get() = Dispatchers.IO + Job()
@@ -36,29 +39,87 @@ class KafkaClient(
 
     private val requestTypes = LRUCache<Int, Int>(100)
 
-    fun sendApiRequest() {
+    fun start() {
         startKafkaConnection()
     }
 
     private fun CoroutineScope.startKafkaConnection() = launch {
-        val socket = aSocket(ActorSelectorManager(Dispatchers.IO)).tcp().connect(InetSocketAddress(host, port))
-        log.info("connected to kafka ${socket.localAddress} -> ${socket.remoteAddress}")
+        try {
+            val selectorManager = SelectorManager(Dispatchers.IO)
+            val socket = if (port == 443 || port == 9093) {
+                aSocket(selectorManager).tcp()
+                    .connect(host, port)
+                    .tls(coroutineContext = coroutineContext) {
+                        trustManager = object : X509TrustManager {
+                            override fun getAcceptedIssuers(): Array<X509Certificate?> = arrayOf()
+                            override fun checkClientTrusted(certs: Array<X509Certificate?>?, authType: String?) {
+                                val x = 1
+                            }
 
-        val writeChannel = socket.openWriteChannel(autoFlush = true)
-        val readChannel = socket.openReadChannel()
+                            override fun checkServerTrusted(certs: Array<X509Certificate?>?, authType: String?) {
+                                val x = 1
+                            }
+                        }
+                    }
+
+            } else {
+                aSocket(selectorManager).tcp().connect(host, port)
+            }
+            log.info("connected to kafka ${socket.localAddress} -> ${socket.remoteAddress}")
+
+            val writeChannel = socket.openWriteChannel(autoFlush = true)
+            log.info("Opened write channel")
+            val apiVersionsRequest = apiVersionsRequest()
+            sendApiMessage(writeChannel, apiVersionsRequest)
+            log.info("Sent api versions request")
+            val readChannel = socket.openReadChannel()
+            log.info("Opened read channel")
+            apiVersions = readChannel.readKafkaResponse()
+            log.info("Got apiversions response $apiVersions")
+            val saslHandshakeRequest = saslHandshakeRequest("GSSAPI")
+            sendApiMessage(writeChannel, saslHandshakeRequest)
+            val saslHandshakeResponse = readChannel.readKafkaResponse<SaslHandshakeResponse>()
+            log.info("SASL handshake response: " + saslHandshakeResponse)
+            socket.close()
+        } catch (e: Exception) {
+            log.error(e.message, e)
+            val x = 1
+        }
+    }
+
+    private fun saslHandshakeRequest(mechanism: String): SaslHandshakeRequestData {
+        val saslHandshakeRequestData = SaslHandshakeRequestData()
+        saslHandshakeRequestData.setMechanism(mechanism)
+        check(apiVersions.apiVersion(ApiKeys.SASL_HANDSHAKE.id).maxVersion() >= 1)
+        return SaslHandshakeRequest(saslHandshakeRequestData, 1).data()
+
+    }
+
+    private fun saslAuth(): SaslAuthenticateRequest {
+        val saslAuthenticateRequestData = SaslAuthenticateRequestData()
+
+        return SaslAuthenticateRequest(
+            saslAuthenticateRequestData,
+            apiVersions.apiVersion(ApiKeys.SASL_AUTHENTICATE.id).maxVersion()
+        )
+    }
+
+    private fun apiVersionsRequest(): ApiVersionsRequestData {
         val apiVersionsRequestData = ApiVersionsRequestData()
         apiVersionsRequestData.setClientSoftwareName("test")
         apiVersionsRequestData.setClientSoftwareVersion("1.0.0")
-        val apiMessage = ApiVersionsRequest(apiVersionsRequestData, version).data()
-        sendApiMessage(writeChannel, apiMessage)
-        val resp = readChannel.readKafkaResponse<ApiVersionsResponse>(ApiKeys.forId(apiMessage.apiKey().toInt()))
-        log.info("resp: $resp")
-        socket.close()
+        return ApiVersionsRequest(apiVersionsRequestData, version).data()
     }
 
     private suspend fun sendApiMessage(writeChannel: ByteWriteChannel, apiMessage: ApiMessage) {
+        val version = apiMessage.highestSupportedVersion()
         val header =
-            RequestHeader(ApiKeys.forId(apiMessage.apiKey().toInt()), version, "test", correlationId.incrementAndGet()).data()
+            RequestHeader(
+                ApiKeys.forId(apiMessage.apiKey().toInt()),
+                version,
+                "test",
+                correlationId.incrementAndGet()
+            ).data()
         val messageSize = MessageSizeAccumulator()
         header.addSize(messageSize, serializationCache, version)
         apiMessage.addSize(messageSize, serializationCache, version)
@@ -77,7 +138,6 @@ class KafkaClient(
         try {
             withTimeout(timeoutMillis) {
                 writeChannel.writePacket(bytePacketBuilder.build())
-                log.debug("Sent command")
             }
         } catch (te: TimeoutCancellationException) {
             log.error("Failed to send kafka command, got timeout")
@@ -243,10 +303,76 @@ private fun Message.write(builder: BytePacketBuilder, cache: ObjectSerialization
     write(BytePacketBuilderWritable(builder), cache, version)
 }
 
-private suspend inline fun <reified T : AbstractResponse> ByteReadChannel.readKafkaResponse(apiKey: ApiKeys): T {
+private suspend inline fun <reified T : AbstractResponse> ByteReadChannel.readKafkaResponse(): T {
     val messageSize = readInt(ByteOrder.BIG_ENDIAN)
     val packet = readPacket(messageSize)
     val packetReadable = ByteReadPacketReadable(packet)
+    val apiKey = when (T::class) {
+        ProduceResponse::class -> ApiKeys.PRODUCE
+        FetchResponse::class -> ApiKeys.FETCH
+        ListOffsetsResponse::class -> ApiKeys.LIST_OFFSETS
+        MetadataResponse::class -> ApiKeys.METADATA
+        LeaderAndIsrResponse::class -> ApiKeys.LEADER_AND_ISR
+        StopReplicaResponse::class -> ApiKeys.STOP_REPLICA
+        UpdateFeaturesResponse::class -> ApiKeys.UPDATE_METADATA
+        ControlledShutdownResponse::class -> ApiKeys.CONTROLLED_SHUTDOWN
+        OffsetCommitResponse::class -> ApiKeys.OFFSET_COMMIT
+        OffsetFetchResponse::class -> ApiKeys.OFFSET_FETCH
+        FindCoordinatorResponse::class -> ApiKeys.FIND_COORDINATOR
+        JoinGroupResponse::class -> ApiKeys.JOIN_GROUP
+        HeartbeatResponse::class -> ApiKeys.HEARTBEAT
+        LeaveGroupResponse::class -> ApiKeys.LEAVE_GROUP
+        SyncGroupResponse::class -> ApiKeys.SYNC_GROUP
+        DescribeGroupsResponse::class -> ApiKeys.DESCRIBE_GROUPS
+        ListGroupsResponse::class -> ApiKeys.LIST_GROUPS
+        SaslHandshakeResponse::class -> ApiKeys.SASL_HANDSHAKE
+        ApiVersionsResponse::class -> ApiKeys.API_VERSIONS
+        CreateTopicsResponse::class -> ApiKeys.CREATE_TOPICS
+        DeleteTopicsResponse::class -> ApiKeys.DELETE_TOPICS
+        DeleteRecordsResponse::class -> ApiKeys.DELETE_RECORDS
+        InitProducerIdResponse::class -> ApiKeys.INIT_PRODUCER_ID
+        OffsetsForLeaderEpochResponse::class -> ApiKeys.OFFSET_FOR_LEADER_EPOCH
+        AddPartitionsToTxnResponse::class -> ApiKeys.ADD_PARTITIONS_TO_TXN
+        AddOffsetsToTxnResponse::class -> ApiKeys.ADD_OFFSETS_TO_TXN
+        EndTxnResponse::class -> ApiKeys.END_TXN
+        WriteTxnMarkersResponse::class -> ApiKeys.WRITE_TXN_MARKERS
+        TxnOffsetCommitResponse::class -> ApiKeys.TXN_OFFSET_COMMIT
+        DescribeConfigsResponse::class -> ApiKeys.DESCRIBE_CONFIGS
+        AlterConfigsResponse::class -> ApiKeys.ALTER_CONFIGS
+        AlterReplicaLogDirsResponse::class -> ApiKeys.ALTER_REPLICA_LOG_DIRS
+        DescribeLogDirsResponse::class -> ApiKeys.DESCRIBE_LOG_DIRS
+        SaslAuthenticateResponse::class -> ApiKeys.SASL_AUTHENTICATE
+        CreatePartitionsResponse::class -> ApiKeys.CREATE_PARTITIONS
+        CreateDelegationTokenResponse::class -> ApiKeys.CREATE_DELEGATION_TOKEN
+        RenewDelegationTokenResponse::class -> ApiKeys.RENEW_DELEGATION_TOKEN
+        ExpireDelegationTokenResponse::class -> ApiKeys.EXPIRE_DELEGATION_TOKEN
+        DescribeDelegationTokenResponse::class -> ApiKeys.DESCRIBE_DELEGATION_TOKEN
+        DeleteGroupsResponse::class -> ApiKeys.DELETE_GROUPS
+        ElectLeadersResponse::class -> ApiKeys.ELECT_LEADERS
+        IncrementalAlterConfigsResponse::class -> ApiKeys.INCREMENTAL_ALTER_CONFIGS
+        AlterPartitionReassignmentsResponse::class -> ApiKeys.ALTER_PARTITION_REASSIGNMENTS
+        ListPartitionReassignmentsResponse::class -> ApiKeys.LIST_PARTITION_REASSIGNMENTS
+        OffsetDeleteResponse::class -> ApiKeys.OFFSET_DELETE
+        DescribeClientQuotasResponse::class -> ApiKeys.DESCRIBE_CLIENT_QUOTAS
+        AlterClientQuotasResponse::class -> ApiKeys.ALTER_CLIENT_QUOTAS
+        DescribeUserScramCredentialsResponse::class -> ApiKeys.DESCRIBE_USER_SCRAM_CREDENTIALS
+        AlterUserScramCredentialsResponse::class -> ApiKeys.ALTER_USER_SCRAM_CREDENTIALS
+        VoteResponse::class -> ApiKeys.VOTE
+        BeginQuorumEpochResponse::class -> ApiKeys.BEGIN_QUORUM_EPOCH
+        EndQuorumEpochResponse::class -> ApiKeys.END_QUORUM_EPOCH
+        DescribeQuorumResponse::class -> ApiKeys.DESCRIBE_QUORUM
+        AlterIsrResponse::class -> ApiKeys.ALTER_ISR
+        UpdateMetadataResponse::class -> ApiKeys.UPDATE_FEATURES
+        EnvelopeResponse::class -> ApiKeys.ENVELOPE
+        FetchSnapshotResponse::class -> ApiKeys.FETCH_SNAPSHOT
+        DescribeClusterResponse::class -> ApiKeys.DESCRIBE_CLUSTER
+        DescribeProducersResponse::class -> ApiKeys.DESCRIBE_PRODUCERS
+        BrokerRegistrationResponse::class -> ApiKeys.BROKER_REGISTRATION
+        BrokerHeartbeatResponse::class -> ApiKeys.BROKER_HEARTBEAT
+        UnregisterBrokerResponse::class -> ApiKeys.UNREGISTER_BROKER
+        ApiVersionsResponse::class -> ApiKeys.API_VERSIONS
+        else -> throw IllegalArgumentException("Unsupported response class ${T::class}")
+    }
     val responseHeader = ResponseHeaderData(packetReadable, apiKey.responseHeaderVersion(version))
     val resp = when (apiKey) {
         ApiKeys.PRODUCE -> ProduceResponse(ProduceResponseData(packetReadable, version))
@@ -256,7 +382,13 @@ private suspend inline fun <reified T : AbstractResponse> ByteReadChannel.readKa
         ApiKeys.LEADER_AND_ISR -> LeaderAndIsrResponse(LeaderAndIsrResponseData(packetReadable, version), version)
         ApiKeys.STOP_REPLICA -> StopReplicaResponse(StopReplicaResponseData(packetReadable, version))
         ApiKeys.UPDATE_METADATA -> UpdateFeaturesResponse(UpdateFeaturesResponseData(packetReadable, version))
-        ApiKeys.CONTROLLED_SHUTDOWN -> ControlledShutdownResponse(ControlledShutdownResponseData(packetReadable, version))
+        ApiKeys.CONTROLLED_SHUTDOWN -> ControlledShutdownResponse(
+            ControlledShutdownResponseData(
+                packetReadable,
+                version
+            )
+        )
+
         ApiKeys.OFFSET_COMMIT -> OffsetCommitResponse(OffsetCommitResponseData(packetReadable, version))
         ApiKeys.OFFSET_FETCH -> OffsetFetchResponse(OffsetFetchResponseData(packetReadable, version), version)
         ApiKeys.FIND_COORDINATOR -> FindCoordinatorResponse(FindCoordinatorResponseData(packetReadable, version))
@@ -272,32 +404,101 @@ private suspend inline fun <reified T : AbstractResponse> ByteReadChannel.readKa
         ApiKeys.DELETE_TOPICS -> DeleteTopicsResponse(DeleteTopicsResponseData(packetReadable, version))
         ApiKeys.DELETE_RECORDS -> DeleteRecordsResponse(DeleteRecordsResponseData(packetReadable, version))
         ApiKeys.INIT_PRODUCER_ID -> InitProducerIdResponse(InitProducerIdResponseData(packetReadable, version))
-        ApiKeys.OFFSET_FOR_LEADER_EPOCH -> OffsetsForLeaderEpochResponse(OffsetForLeaderEpochResponseData(packetReadable, version))
-        ApiKeys.ADD_PARTITIONS_TO_TXN -> AddPartitionsToTxnResponse(AddPartitionsToTxnResponseData(packetReadable, version))
+        ApiKeys.OFFSET_FOR_LEADER_EPOCH -> OffsetsForLeaderEpochResponse(
+            OffsetForLeaderEpochResponseData(
+                packetReadable,
+                version
+            )
+        )
+
+        ApiKeys.ADD_PARTITIONS_TO_TXN -> AddPartitionsToTxnResponse(
+            AddPartitionsToTxnResponseData(
+                packetReadable,
+                version
+            )
+        )
+
         ApiKeys.ADD_OFFSETS_TO_TXN -> AddOffsetsToTxnResponse(AddOffsetsToTxnResponseData(packetReadable, version))
         ApiKeys.END_TXN -> EndTxnResponse(EndTxnResponseData(packetReadable, version))
         ApiKeys.WRITE_TXN_MARKERS -> WriteTxnMarkersResponse(WriteTxnMarkersResponseData(packetReadable, version))
         ApiKeys.TXN_OFFSET_COMMIT -> TxnOffsetCommitResponse(TxnOffsetCommitResponseData(packetReadable, version))
         ApiKeys.DESCRIBE_CONFIGS -> DescribeConfigsResponse(DescribeConfigsResponseData(packetReadable, version))
         ApiKeys.ALTER_CONFIGS -> AlterConfigsResponse(AlterConfigsResponseData(packetReadable, version))
-        ApiKeys.ALTER_REPLICA_LOG_DIRS -> AlterReplicaLogDirsResponse(AlterReplicaLogDirsResponseData(packetReadable, version))
+        ApiKeys.ALTER_REPLICA_LOG_DIRS -> AlterReplicaLogDirsResponse(
+            AlterReplicaLogDirsResponseData(
+                packetReadable,
+                version
+            )
+        )
+
         ApiKeys.DESCRIBE_LOG_DIRS -> DescribeLogDirsResponse(DescribeLogDirsResponseData(packetReadable, version))
         ApiKeys.SASL_AUTHENTICATE -> SaslAuthenticateResponse(SaslAuthenticateResponseData(packetReadable, version))
         ApiKeys.CREATE_PARTITIONS -> CreatePartitionsResponse(CreatePartitionsResponseData(packetReadable, version))
-        ApiKeys.CREATE_DELEGATION_TOKEN -> CreateDelegationTokenResponse(CreateDelegationTokenResponseData(packetReadable, version))
-        ApiKeys.RENEW_DELEGATION_TOKEN -> RenewDelegationTokenResponse(RenewDelegationTokenResponseData(packetReadable, version))
-        ApiKeys.EXPIRE_DELEGATION_TOKEN -> ExpireDelegationTokenResponse(ExpireDelegationTokenResponseData(packetReadable, version))
-        ApiKeys.DESCRIBE_DELEGATION_TOKEN -> DescribeDelegationTokenResponse(DescribeDelegationTokenResponseData(packetReadable, version))
+        ApiKeys.CREATE_DELEGATION_TOKEN -> CreateDelegationTokenResponse(
+            CreateDelegationTokenResponseData(
+                packetReadable,
+                version
+            )
+        )
+
+        ApiKeys.RENEW_DELEGATION_TOKEN -> RenewDelegationTokenResponse(
+            RenewDelegationTokenResponseData(
+                packetReadable,
+                version
+            )
+        )
+
+        ApiKeys.EXPIRE_DELEGATION_TOKEN -> ExpireDelegationTokenResponse(
+            ExpireDelegationTokenResponseData(
+                packetReadable,
+                version
+            )
+        )
+
+        ApiKeys.DESCRIBE_DELEGATION_TOKEN -> DescribeDelegationTokenResponse(
+            DescribeDelegationTokenResponseData(
+                packetReadable,
+                version
+            )
+        )
+
         ApiKeys.DELETE_GROUPS -> DeleteGroupsResponse(DeleteGroupsResponseData(packetReadable, version))
         ApiKeys.ELECT_LEADERS -> ElectLeadersResponse(ElectLeadersResponseData(packetReadable, version))
-        ApiKeys.INCREMENTAL_ALTER_CONFIGS -> IncrementalAlterConfigsResponse(IncrementalAlterConfigsResponseData(packetReadable, version))
-        ApiKeys.ALTER_PARTITION_REASSIGNMENTS -> AlterPartitionReassignmentsResponse(AlterPartitionReassignmentsResponseData(packetReadable, version))
-        ApiKeys.LIST_PARTITION_REASSIGNMENTS -> ListPartitionReassignmentsResponse(ListPartitionReassignmentsResponseData(packetReadable, version))
+        ApiKeys.INCREMENTAL_ALTER_CONFIGS -> IncrementalAlterConfigsResponse(
+            IncrementalAlterConfigsResponseData(
+                packetReadable,
+                version
+            )
+        )
+
+        ApiKeys.ALTER_PARTITION_REASSIGNMENTS -> AlterPartitionReassignmentsResponse(
+            AlterPartitionReassignmentsResponseData(packetReadable, version)
+        )
+
+        ApiKeys.LIST_PARTITION_REASSIGNMENTS -> ListPartitionReassignmentsResponse(
+            ListPartitionReassignmentsResponseData(packetReadable, version)
+        )
+
         ApiKeys.OFFSET_DELETE -> OffsetDeleteResponse(OffsetDeleteResponseData(packetReadable, version))
-        ApiKeys.DESCRIBE_CLIENT_QUOTAS -> DescribeClientQuotasResponse(DescribeClientQuotasResponseData(packetReadable, version))
+        ApiKeys.DESCRIBE_CLIENT_QUOTAS -> DescribeClientQuotasResponse(
+            DescribeClientQuotasResponseData(
+                packetReadable,
+                version
+            )
+        )
+
         ApiKeys.ALTER_CLIENT_QUOTAS -> AlterClientQuotasResponse(AlterClientQuotasResponseData(packetReadable, version))
-        ApiKeys.DESCRIBE_USER_SCRAM_CREDENTIALS -> DescribeUserScramCredentialsResponse(DescribeUserScramCredentialsResponseData(packetReadable, version))
-        ApiKeys.ALTER_USER_SCRAM_CREDENTIALS -> AlterUserScramCredentialsResponse(AlterUserScramCredentialsResponseData(packetReadable, version))
+        ApiKeys.DESCRIBE_USER_SCRAM_CREDENTIALS -> DescribeUserScramCredentialsResponse(
+            DescribeUserScramCredentialsResponseData(packetReadable, version)
+        )
+
+        ApiKeys.ALTER_USER_SCRAM_CREDENTIALS -> AlterUserScramCredentialsResponse(
+            AlterUserScramCredentialsResponseData(
+                packetReadable,
+                version
+            )
+        )
+
         ApiKeys.VOTE -> VoteResponse(VoteResponseData(packetReadable, version))
         ApiKeys.BEGIN_QUORUM_EPOCH -> BeginQuorumEpochResponse(BeginQuorumEpochResponseData(packetReadable, version))
         ApiKeys.END_QUORUM_EPOCH -> EndQuorumEpochResponse(EndQuorumEpochResponseData(packetReadable, version))
@@ -308,7 +509,13 @@ private suspend inline fun <reified T : AbstractResponse> ByteReadChannel.readKa
         ApiKeys.FETCH_SNAPSHOT -> FetchSnapshotResponse(FetchSnapshotResponseData(packetReadable, version))
         ApiKeys.DESCRIBE_CLUSTER -> DescribeClusterResponse(DescribeClusterResponseData(packetReadable, version))
         ApiKeys.DESCRIBE_PRODUCERS -> DescribeProducersResponse(DescribeProducersResponseData(packetReadable, version))
-        ApiKeys.BROKER_REGISTRATION -> BrokerRegistrationResponse(BrokerRegistrationResponseData(packetReadable, version))
+        ApiKeys.BROKER_REGISTRATION -> BrokerRegistrationResponse(
+            BrokerRegistrationResponseData(
+                packetReadable,
+                version
+            )
+        )
+
         ApiKeys.BROKER_HEARTBEAT -> BrokerHeartbeatResponse(BrokerHeartbeatResponseData(packetReadable, version))
         ApiKeys.UNREGISTER_BROKER -> UnregisterBrokerResponse(UnregisterBrokerResponseData(packetReadable, version))
         else -> TODO("Not implemented apiKey $apiKey")
@@ -365,10 +572,9 @@ private fun BytePacketBuilder.writeCompactString(text: String) {
 }
 
 fun main() {
-    val kafkaClient = KafkaClient("127.0.0.1", 9092)
+    val kafkaClient = KafkaClient("localhost", 443)
     runBlocking {
-        kafkaClient.sendApiRequest()
-        delay(10000)
+        kafkaClient.start()
     }
-
+    Thread.sleep(Long.MAX_VALUE)
 }
