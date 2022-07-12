@@ -50,6 +50,7 @@ class KafkaClient(
                 aSocket(selectorManager).tcp()
                     .connect(host, port)
                     .tls(coroutineContext = coroutineContext) {
+                        serverName = host
                         trustManager = object : X509TrustManager {
                             override fun getAcceptedIssuers(): Array<X509Certificate?> = arrayOf()
                             override fun checkClientTrusted(certs: Array<X509Certificate?>?, authType: String?) {
@@ -149,6 +150,7 @@ class KafkaClient(
 
         return true
     }
+
 }
 
 class BytePacketBuilderWritable(private val bytePacketBuilder: BytePacketBuilder) : Writable,
@@ -284,6 +286,7 @@ private fun Message.write(builder: BytePacketBuilder, cache: ObjectSerialization
 
 private suspend inline fun <reified T : AbstractResponse> ByteReadChannel.readKafkaResponse(): T {
     val messageSize = readInt(ByteOrder.BIG_ENDIAN)
+    log.info("About to read a packet of $messageSize bytes")
     val packet = readPacket(messageSize)
     val packetReadable = ByteReadPacketReadable(packet)
     val apiKey = when (T::class) {
@@ -502,7 +505,7 @@ private suspend inline fun <reified T : AbstractResponse> ByteReadChannel.readKa
     return resp as T
 }
 fun main() {
-    val kafkaClient = KafkaClient("localhost", 443)
+    val kafkaClient = KafkaClient(System.getenv(("KAFKA_HOST")), 443)
     runBlocking {
         kafkaClient.start()
     }
