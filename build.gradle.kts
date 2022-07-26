@@ -13,7 +13,7 @@ repositories {
 
 kotlin {
     jvmToolchain {
-        languageVersion.set(JavaLanguageVersion.of(18))
+        languageVersion.set(JavaLanguageVersion.of(17))
     }
 }
 
@@ -29,6 +29,7 @@ dependencies {
     implementation("io.ktor:ktor-network-tls:2.0.3")
     implementation("io.ktor:ktor-network-tls:2.0.3:sources")
     implementation("io.ktor:ktor-network-tls-jvm:2.0.3:sources")
+    implementation("com.bolyartech.scram_sasl:scram_sasl:2.0.2")
 }
 
 tasks.test {

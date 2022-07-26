@@ -1,9 +1,13 @@
+import com.bolyartech.scram_sasl.client.ScramSaslClientProcessor
+import com.bolyartech.scram_sasl.client.ScramSha256SaslClientProcessor
+import com.bolyartech.scram_sasl.client.ScramSha512SaslClientProcessor
 import io.ktor.network.selector.*
 import io.ktor.network.sockets.*
 import io.ktor.network.tls.*
 import io.ktor.utils.io.*
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
 import org.apache.kafka.common.message.*
 import org.apache.kafka.common.protocol.*
 import org.apache.kafka.common.record.MemoryRecords
@@ -46,7 +50,7 @@ class KafkaClient(
     private fun CoroutineScope.startKafkaConnection() = launch {
         try {
             val selectorManager = SelectorManager(Dispatchers.IO)
-            val socket = if (port == 443 || port == 9093) {
+            val socket = if (port == 443 || port == 9093 || port == 19094) {
                 aSocket(selectorManager).tcp()
                     .connect(host, port)
                     .tls(coroutineContext = coroutineContext) {
@@ -77,15 +81,53 @@ class KafkaClient(
             log.info("Opened read channel")
             apiVersions = readChannel.readKafkaResponse()
             log.info("Got apiversions response $apiVersions")
-            val saslHandshakeRequest = saslHandshakeRequest("GSSAPI")
+            val saslHandshakeRequest = saslHandshakeRequest("SCRAM-SHA-512")
             sendApiMessage(writeChannel, saslHandshakeRequest)
             val saslHandshakeResponse = readChannel.readKafkaResponse<SaslHandshakeResponse>()
-            log.info("SASL handshake response: " + saslHandshakeResponse)
+            log.info("SASL handshake response: $saslHandshakeResponse")
+            val saslMutex = Mutex()
+
+            val listener: ScramSaslClientProcessor.Listener = object : ScramSaslClientProcessor.Listener {
+                override fun onSuccess() {
+                    log.info("SASL auth success")
+                    saslMutex.unlock()
+                }
+                override fun onFailure() {
+                    log.info("SASL auth failure")
+                    saslMutex.unlock()
+                }
+            }
+
+            lateinit var saslClientProcessor: ScramSaslClientProcessor
+            val sender = ScramSaslClientProcessor.Sender {
+                log.info("About to send $it")
+                val saslAuthenticateRequest = saslAuthenticateRequest(it.toByteArray())
+                runBlocking {
+                    sendApiMessage(writeChannel, saslAuthenticateRequest)
+                    val saslAuthenticateResponse = readChannel.readKafkaResponse<SaslAuthenticateResponse>()
+                    saslClientProcessor.onMessage(saslAuthenticateResponse.saslAuthBytes().decodeToString())
+                }
+            }
+            saslClientProcessor = ScramSha512SaslClientProcessor(
+                listener, sender
+            )
+            saslMutex.lock()
+            saslClientProcessor.start(System.getenv("KAFKA_USERNAME"), System.getenv("KAFKA_PASSWORD"))
+            withTimeout(30000) {
+                saslMutex.lock()
+            }
+            log.info("Authentication complete")
             socket.close()
         } catch (e: Exception) {
             log.error(e.message, e)
             val x = 1
         }
+    }
+
+    private fun saslAuthenticateRequest(authBytes: ByteArray): SaslAuthenticateRequestData {
+        val saslAuthenticateRequestData = SaslAuthenticateRequestData()
+        saslAuthenticateRequestData.setAuthBytes(authBytes)
+        return saslAuthenticateRequestData
     }
 
     private fun saslHandshakeRequest(mechanism: String): SaslHandshakeRequestData {
@@ -505,7 +547,7 @@ private suspend inline fun <reified T : AbstractResponse> ByteReadChannel.readKa
     return resp as T
 }
 fun main() {
-    val kafkaClient = KafkaClient(System.getenv(("KAFKA_HOST")), 443)
+    val kafkaClient = KafkaClient(System.getenv(("KAFKA_HOST")), 19094)
     runBlocking {
         kafkaClient.start()
     }
